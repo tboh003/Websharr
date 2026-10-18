@@ -18,7 +18,7 @@ docker compose up -d
 ```
 
 This pulls the prebuilt image `ghcr.io/tboh003/websharr` (tags: `latest`,
-the version number, e.g. `0.3.11`). To build from source instead, uncomment
+the version number, e.g. `0.4.0`). To build from source instead, uncomment
 `build: .` in `docker-compose.yml` and run `docker compose up -d --build`.
 
 Then open **`http://localhost:9797/ui`** and walk through the first-run setup:
@@ -109,7 +109,9 @@ to a [pyLoad](https://pyload.net) instance (0.5.0 or newer) instead.
 
 - Set `DOWNLOAD_BACKEND=pyload`, `PYLOAD_URL` and `PYLOAD_API_KEY` (create the key
   in the pyLoad web UI; it starts with `pl_`). All except `PYLOAD_DOWNLOAD_DIR` can
-  also be set in **Settings** (the UI value wins).
+  also be set in **Settings**. A value set in Settings overrides the environment; a
+  field not set in Settings follows the environment, so a rotated `PYLOAD_API_KEY`
+  (for example from Vault) takes effect after a restart.
 - `PYLOAD_DOWNLOAD_DIR` (default `/downloads`) is the path where Websharr sees the
   pyLoad storage folder. Websharr, pyLoad and Sonarr/Radarr must all see the same
   download folder, and the pyLoad option `general.folder_per_package` must be on.
@@ -175,7 +177,7 @@ as normal; you just lose the automatic Czech-title resolution.
 | `INCOMPLETE_DIR` | `/downloads/incomplete` | in-progress files |
 | `STATE_FILE` | `/config/state.json` | queue/history persistence |
 | `MAX_CONCURRENT_DOWNLOADS` | `2` | concurrent downloads |
-| `DOWNLOAD_BACKEND` | `direct` | `direct` or `pyload` (see [pyLoad backend](#pyload-backend)) |
+| `DOWNLOAD_BACKEND` | `direct` | `direct` or `pyload` (see [pyLoad backend](#pyload-backend)) (UI value wins) |
 | `PYLOAD_URL` / `PYLOAD_API_KEY` | — | pyLoad address and API key (UI value wins) |
 | `PYLOAD_DOWNLOAD_DIR` | `/downloads` | path where Websharr sees the pyLoad storage folder |
 | `PYLOAD_STALL_HOURS` | `24` | fail a pyLoad job with no byte progress for this long (UI value wins) |
