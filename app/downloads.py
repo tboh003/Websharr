@@ -480,7 +480,7 @@ class DownloadManager:
                 logger.info("Handed %s to pyLoad as package %d", job.nzo_id, job.pyload_pid)
                 await self._pyload_wait(job, reattached=False)
             await self._pyload_finish(job)
-        except (PyloadError, WebshareError, OSError):
+        except (PyloadError, WebshareError, httpx.HTTPError, OSError):
             raise
         except Exception as exc:
             raise PyloadError(f"unexpected pyLoad response: {type(exc).__name__}: {exc}") from exc
@@ -536,10 +536,11 @@ class DownloadManager:
         final_dir = self._complete_dir / job.category / job.job_name
         final_dir.mkdir(parents=True, exist_ok=True)
         size = source.stat().st_size
-        shutil.move(str(source), final_dir / job.name)
+        # Off the event loop: across volumes the move is a multi-GB copy.
+        await asyncio.to_thread(shutil.move, str(source), final_dir / job.name)
+        job.storage = str(final_dir)  # set now so a delete(del_files) during cleanup removes it
         await self._pyload_cleanup(job)
         job.pyload_pid = 0
-        job.storage = str(final_dir)
         job.size = job.downloaded = max(job.size, size)
 
     async def _pyload_cleanup(self, job: Job) -> None:
@@ -550,7 +551,7 @@ class DownloadManager:
                 await self._pyload.delete_package(job.pyload_pid)
             except PyloadError as exc:
                 logger.debug("pyLoad package %d not deleted: %s", job.pyload_pid, exc)
-        shutil.rmtree(self._pyload_folder(job), ignore_errors=True)
+        await asyncio.to_thread(shutil.rmtree, self._pyload_folder(job), ignore_errors=True)
 
 
 def _fmt_duration(seconds: float) -> str:
