@@ -17,7 +17,7 @@ A bridge between **Webshare.cz** (premium account) and the ***arr stack** (Sonar
 docker compose up -d
 ```
 
-This pulls the prebuilt image `ghcr.io/janprochy/websharr` (tags: `latest`,
+This pulls the prebuilt image `ghcr.io/tboh003/websharr` (tags: `latest`,
 the version number, e.g. `0.3.11`). To build from source instead, uncomment
 `build: .` in `docker-compose.yml` and run `docker compose up -d --build`.
 
@@ -102,6 +102,26 @@ Sonarr/Radarr; the SABnzbd download client is still added directly in each *arr.
   Czech (or use a dedicated profile) if you grab CZ content.
 - Watch the **Log** tab to see the *arr requests arrive in real time.
 
+## pyLoad backend
+
+By default Websharr downloads files itself. Optionally it can hand each download
+to a [pyLoad](https://pyload.net) instance (0.5.0 or newer) instead.
+
+- Set `DOWNLOAD_BACKEND=pyload`, `PYLOAD_URL` and `PYLOAD_API_KEY` (create the key
+  in the pyLoad web UI; it starts with `pl_`). All except `PYLOAD_DOWNLOAD_DIR` can
+  also be set in **Settings** (the UI value wins).
+- `PYLOAD_DOWNLOAD_DIR` (default `/downloads`) is the path where Websharr sees the
+  pyLoad storage folder. Websharr, pyLoad and Sonarr/Radarr must all see the same
+  download folder, and the pyLoad option `general.folder_per_package` must be on.
+  pyLoad needs no Webshare plugin.
+- Each job becomes a pyLoad package named `websharr-<job id>`. When it finishes,
+  Websharr moves the file to `<COMPLETE_DIR>/<category>/<release>/` and removes the
+  package and its folder. Packages without the `websharr-` prefix are never touched.
+- `PYLOAD_STALL_HOURS` (default `24`): a job with no byte progress for that long fails.
+- The pyLoad backend has **no pause/resume**.
+- A free Webshare account runs at roughly 0.3 MB/s (about 1 GB per hour) and has an
+  unknown daily quota. pyLoad does not make Webshare faster.
+
 ## Czech titles (TMDB)
 
 Sonarr/Radarr search by the title they know — usually the English one — but
@@ -155,6 +175,10 @@ as normal; you just lose the automatic Czech-title resolution.
 | `INCOMPLETE_DIR` | `/downloads/incomplete` | in-progress files |
 | `STATE_FILE` | `/config/state.json` | queue/history persistence |
 | `MAX_CONCURRENT_DOWNLOADS` | `2` | concurrent downloads |
+| `DOWNLOAD_BACKEND` | `direct` | `direct` or `pyload` (see [pyLoad backend](#pyload-backend)) |
+| `PYLOAD_URL` / `PYLOAD_API_KEY` | — | pyLoad address and API key (UI value wins) |
+| `PYLOAD_DOWNLOAD_DIR` | `/downloads` | path where Websharr sees the pyLoad storage folder |
+| `PYLOAD_STALL_HOURS` | `24` | fail a pyLoad job with no byte progress for this long (UI value wins) |
 | `SEARCH_LIMIT` | `60` | max results from Webshare per query |
 
 ## How search results are cleaned up
