@@ -26,7 +26,8 @@ from . import notify
 from .applog import records as log_records
 from .config import config
 from .downloads import DownloadManager, Job
-from .settings import SESSION_TTL, THEMES, hash_password, settings, verify_password
+from .pyload import PyloadClient
+from .settings import BACKENDS, SESSION_TTL, THEMES, hash_password, settings, verify_password
 from .torznab import (
     VIDEO_EXTENSIONS,
     build_queries,
@@ -182,6 +183,10 @@ async def ui_settings_get(request: Request):
         "aliases": settings.aliases,
         "tmdb_token_set": bool(settings.tmdb_token),
         "max_concurrent": request.app.state.downloads.max_concurrent,
+        "download_backend": request.app.state.downloads.backend,
+        "pyload_url": settings.pyload_url,
+        "pyload_api_key_set": bool(settings.pyload_api_key),
+        "pyload_stall_hours": settings.pyload_stall_hours,
         "notify_urls": settings.notify_urls,
         "notify_vip_days": settings.notify_vip_days,
         "theme": settings.theme,
@@ -261,6 +266,28 @@ async def ui_settings_post(request: Request):
             return JSONResponse({"error": "max_concurrent must be a number"}, status_code=400)
         settings.max_concurrent = request.app.state.downloads.set_max_concurrent(n)
 
+    pyload_changed = False
+    if any(k in body for k in ("download_backend", "pyload_url", "pyload_api_key",
+                               "pyload_stall_hours")):
+        backend = body.get("download_backend", settings.download_backend)
+        if backend not in BACKENDS:
+            return JSONResponse({"error": "Unknown download backend"}, status_code=400)
+        url = (body.get("pyload_url", settings.pyload_url) or "").strip().rstrip("/")
+        # No key in the request keeps the saved one; the key is never echoed back.
+        key = (body.get("pyload_api_key") or "").strip() or settings.pyload_api_key
+        try:
+            hours = max(1, int(body.get("pyload_stall_hours", settings.pyload_stall_hours)))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "pyload_stall_hours must be a number"}, status_code=400)
+        if backend == "pyload" and not (url and key):
+            return JSONResponse(
+                {"error": "pyLoad needs a URL and an API key"}, status_code=400)
+        pyload_changed = True
+        settings.download_backend = backend
+        settings.pyload_url = url
+        settings.pyload_api_key = key
+        settings.pyload_stall_hours = hours
+
     if "notify_urls" in body:
         settings.notify_urls = _parse_urls(body.get("notify_urls"))
     if "notify_vip_days" in body:
@@ -278,6 +305,17 @@ async def ui_settings_post(request: Request):
     settings.apply()
     request.app.state.webshare.set_credentials(
         config.webshare_username, config.webshare_password, config.webshare_password_digest)
+    if pyload_changed:
+        manager: DownloadManager = request.app.state.downloads
+        old = getattr(request.app.state, "pyload", None)
+        new = (PyloadClient(config.pyload_url, config.pyload_api_key)
+               if config.pyload_url and config.pyload_api_key else None)
+        manager.set_pyload(new, config.pyload_download_dir,
+                           max(1, settings.pyload_stall_hours) * 3600.0)
+        request.app.state.pyload = new
+        if old is not None:
+            await old.close()
+        manager.set_backend(settings.download_backend)
     return {"ok": True, "api_key": config.api_key}
 
 

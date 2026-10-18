@@ -83,6 +83,7 @@ async def lifespan(app: FastAPI):
     manager.resume_pending()
     app.state.webshare = client
     app.state.downloads = manager
+    app.state.pyload = pyload
     app.state.account = None
     app.state.account_ts = 0.0
     monitor_task = asyncio.create_task(_account_monitor(app))
@@ -93,8 +94,8 @@ async def lifespan(app: FastAPI):
     await asyncio.gather(monitor_task, return_exceptions=True)
     await manager.shutdown()
     await client.close()
-    if pyload is not None:
-        await pyload.close()
+    if app.state.pyload is not None:  # may have been replaced from the settings UI
+        await app.state.pyload.close()
 
 
 async def _send_notification(title: str, body: str) -> None:
