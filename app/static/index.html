@@ -861,6 +861,35 @@
 
     <div class="scard">
       <div class="sinfo">
+        <h3>Download backend</h3>
+        <p class="shint">Download with the built-in downloader (<b>direct</b>), or hand
+          each file to a shared <b>pyLoad</b> instance. pyLoad downloads cannot be
+          paused. Changes apply to new downloads only.</p>
+      </div>
+      <div class="sform">
+        <label>Backend
+          <select id="set-backend">
+            <option value="direct">Direct (built-in)</option>
+            <option value="pyload">pyLoad</option>
+          </select></label>
+        <label>pyLoad URL
+          <input id="set-pyload-url" type="text" autocomplete="off"
+            placeholder="http://pyload:8000"></label>
+        <label>pyLoad API key
+          <input id="set-pyload-key" type="password" autocomplete="off"
+            placeholder="•••••••• (leave empty to keep current)"></label>
+        <label>Stall timeout (hours)
+          <input id="set-pyload-stall" type="number" min="1" step="1" value="6"></label>
+        <div class="srow">
+          <div class="spacer"></div>
+          <button class="primary" id="set-backend-save">Save backend</button>
+        </div>
+        <span class="sresult" id="set-backend-result"></span>
+      </div>
+    </div>
+
+    <div class="scard">
+      <div class="sinfo">
         <h3>Czech titles (TMDB)</h3>
         <p class="shint">Sonarr/Radarr search by the title they know (usually English),
           but many Webshare files use the Czech name. With a <b>TMDB API Read Access
@@ -1146,6 +1175,12 @@ const App = {
       $("set-tmdb-token").value = "";
       $("set-tmdb-token").placeholder = s.tmdb_token_set
         ? "•••••••• (set — leave empty to keep)" : "TMDB Read Access Token";
+      $("set-backend").value = s.download_backend || "direct";
+      $("set-pyload-url").value = s.pyload_url || "";
+      $("set-pyload-key").value = "";
+      $("set-pyload-key").placeholder = s.pyload_api_key_set
+        ? "•••••••• (set — leave empty to keep)" : "pyLoad API key";
+      $("set-pyload-stall").value = s.pyload_stall_hours || 6;
       this.renderAliases(s.aliases || []);
     } catch (e) { /* offline banner already covers this */ }
   },
@@ -1297,6 +1332,10 @@ const App = {
         : `<svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><rect x="4" y="3" width="3" height="10" rx="1"/><rect x="9" y="3" width="3" height="10" rx="1"/></svg>`;
       pbtn.title = paused ? "Resume" : "Pause";
       pbtn.setAttribute("aria-label", paused ? "Resume download" : "Pause download");
+      // pyLoad owns the transfer, so Websharr cannot pause or resume it.
+      const noPause = j.backend === "pyload";
+      pbtn.disabled = noPause;
+      if (noPause) pbtn.title = "Pause is not available for pyLoad downloads";
       const bar = card.querySelector(".bar");
       bar.style.width = pct.toFixed(1) + "%";
       bar.classList.toggle("queued", !dl);
@@ -1756,6 +1795,21 @@ $("set-pass-save").onclick = async () => {
     sresult("set-pass-result", true, "✓ Password changed");
     $("set-cur-pass").value = ""; $("set-new-pass").value = "";
   } catch (e) { sresult("set-pass-result", false, e.message); }
+};
+
+$("set-backend-save").onclick = async () => {
+  const body = {
+    download_backend: $("set-backend").value,
+    pyload_url: $("set-pyload-url").value.trim(),
+    pyload_stall_hours: parseInt($("set-pyload-stall").value, 10) || 6,
+  };
+  const key = $("set-pyload-key").value.trim();
+  if (key) body.pyload_api_key = key;   // empty keeps the saved key
+  try {
+    await uiPost("settings", body);
+    sresult("set-backend-result", true, "✓ Saved");
+    App.loadSettings();
+  } catch (e) { sresult("set-backend-result", false, e.message); }
 };
 
 $("set-tmdb-save").onclick = async () => {
