@@ -18,6 +18,7 @@ from . import applog
 from . import notify
 from .config import config
 from .downloads import DownloadManager
+from .pyload import PyloadClient
 from .sabnzbd import router as sabnzbd_router
 from .settings import settings
 from .torznab import router as torznab_router
@@ -58,6 +59,13 @@ async def lifespan(app: FastAPI):
             logger.info("Migrated stored Webshare password to a login digest")
         except Exception as exc:
             logger.warning("Webshare password not migrated to digest yet: %s", exc)
+    pyload = None
+    if config.pyload_url and config.pyload_api_key:
+        pyload = PyloadClient(config.pyload_url, config.pyload_api_key)
+    backend = settings.download_backend
+    if backend == "pyload" and pyload is None:
+        logger.warning("Download backend pyload needs a pyLoad URL and API key; using direct")
+        backend = "direct"
     manager = DownloadManager(
         client=client,
         complete_dir=config.complete_dir,
@@ -65,6 +73,10 @@ async def lifespan(app: FastAPI):
         state_file=config.state_file,
         max_concurrent=settings.max_concurrent,
         notify=_send_notification,
+        pyload=pyload,
+        backend=backend,
+        pyload_dir=config.pyload_download_dir,
+        stall_seconds=max(1, settings.pyload_stall_hours) * 3600,
     )
     manager.ensure_dirs()
     manager.load_state()
@@ -81,6 +93,8 @@ async def lifespan(app: FastAPI):
     await asyncio.gather(monitor_task, return_exceptions=True)
     await manager.shutdown()
     await client.close()
+    if pyload is not None:
+        await pyload.close()
 
 
 async def _send_notification(title: str, body: str) -> None:
