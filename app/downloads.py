@@ -3,6 +3,10 @@
 Jobs persist to a JSON state file so history survives restarts; jobs that were
 still downloading are re-queued on startup and resume from the partial file in
 the incomplete dir via an HTTP Range request.
+
+With the "pyload" backend a job is handed to a shared pyLoad instance as the
+package websharr-<nzo_id> and polled until it finishes; Websharr then moves
+the file into the complete dir and removes the package and its folder.
 """
 
 import asyncio
@@ -17,12 +21,19 @@ from pathlib import Path
 import httpx
 
 from .nzb import sanitize_filename
+from .pyload import FAILED_STATES, FINISHED, PyloadClient, PyloadError, PyloadPackageGone
+from .settings import BACKENDS
 from .webshare import WebshareClient, WebshareError
 
 logger = logging.getLogger("websharr.downloads")
 
 CHUNK_SIZE = 1024 * 1024
 HISTORY_CAP = 500  # keep this many completed/failed records in the UI history
+PYLOAD_POLL_SECONDS = 5.0  # seconds between pyLoad status polls
+
+
+class _StaleAttach(Exception):
+    """A re-attached pyLoad package is gone or failed: start over once."""
 
 
 def describe_error(exc: BaseException) -> str:
@@ -67,6 +78,10 @@ class Job:
     # we honor that for the SABnzbd view but keep the record in the Websharr UI
     # history. This flag hides it from Sonarr only.
     sab_hidden: bool = False
+    # Backend chosen when the job was added; a pyLoad job remembers its package
+    # id so a restart re-attaches instead of adding a second package.
+    backend: str = "direct"
+    pyload_pid: int = 0
 
     @property
     def job_name(self) -> str:
@@ -78,7 +93,9 @@ class Job:
 
 class DownloadManager:
     def __init__(self, client: WebshareClient, complete_dir: Path, incomplete_dir: Path,
-                 state_file: Path, max_concurrent: int = 2, notify=None):
+                 state_file: Path, max_concurrent: int = 2, notify=None,
+                 pyload: PyloadClient | None = None, backend: str = "direct",
+                 pyload_dir: Path = Path("/downloads"), stall_seconds: float = 86400):
         self._client = client
         self._complete_dir = complete_dir
         self._incomplete_dir = incomplete_dir
@@ -88,6 +105,37 @@ class DownloadManager:
         self._tasks: dict[str, asyncio.Task] = {}
         # Optional async callback (title, body) for failure notifications.
         self._notify = notify
+        self._pyload = pyload
+        self._pyload_dir = pyload_dir
+        self._stall_seconds = stall_seconds
+        self._cleanups: set[asyncio.Task] = set()
+        self._backend = "direct"
+        self.set_backend(backend)
+
+    @property
+    def backend(self) -> str:
+        return self._backend
+
+    def set_backend(self, value: str) -> str:
+        """Choose the backend for jobs added from now on; queued and running
+        jobs keep the one they were added with."""
+        if value not in BACKENDS:
+            raise ValueError(f"unknown download backend: {value}")
+        if value == "pyload" and self._pyload is None:
+            raise ValueError("pyLoad backend needs a pyLoad URL and API key")
+        self._backend = value
+        return self._backend
+
+    def set_pyload(self, client: PyloadClient | None, pyload_dir: Path,
+                   stall_seconds: float) -> None:
+        """Swap the pyLoad connection at runtime. Without a client, new jobs
+        fall back to the direct backend."""
+        self._pyload = client
+        self._pyload_dir = pyload_dir
+        self._stall_seconds = stall_seconds
+        if client is None and self._backend == "pyload":
+            logger.warning("pyLoad is not configured; new downloads use the direct backend")
+            self._backend = "direct"
 
     @property
     def max_concurrent(self) -> int:
@@ -154,6 +202,7 @@ class DownloadManager:
             category=category or "*",
             size=size,
             title=sanitize_filename(title) if title else "",
+            backend=self._backend,
         )
         self._jobs[job.nzo_id] = job
         self._save_state()
@@ -189,6 +238,8 @@ class DownloadManager:
         job = self._jobs.get(nzo_id)
         if job is None or job.status not in ("queued", "downloading"):
             return False
+        if job.backend == "pyload":
+            return False  # pyLoad has no per-package pause
         job.status = "paused"
         job.speed = 0.0
         task = self._tasks.pop(nzo_id, None)
@@ -258,6 +309,10 @@ class DownloadManager:
         if task is not None and not task.done():
             task.cancel()
         self._cleanup_incomplete(job)
+        if job.backend == "pyload":
+            cleanup = asyncio.create_task(self._pyload_cleanup(job))
+            self._cleanups.add(cleanup)
+            cleanup.add_done_callback(self._cleanups.discard)
         if del_files and job.storage:
             shutil.rmtree(job.storage, ignore_errors=True)
         self._save_state()
@@ -269,6 +324,8 @@ class DownloadManager:
                 task.cancel()
         if self._tasks:
             await asyncio.gather(*self._tasks.values(), return_exceptions=True)
+        if self._cleanups:
+            await asyncio.gather(*self._cleanups, return_exceptions=True)
         self._save_state()
 
     # -- internals ---------------------------------------------------------
@@ -308,7 +365,7 @@ class DownloadManager:
         except asyncio.CancelledError:
             logger.info("Cancelled %s", job.nzo_id)
             raise
-        except (WebshareError, httpx.HTTPError, OSError) as exc:
+        except (WebshareError, PyloadError, httpx.HTTPError, OSError) as exc:
             job.status = "failed"
             job.error = describe_error(exc)
             job.completed_ts = time.time()
@@ -337,6 +394,9 @@ class DownloadManager:
             self.delete(job.nzo_id)
 
     async def _download(self, job: Job) -> None:
+        if job.backend == "pyload":
+            await self._download_pyload(job)
+            return
         # No retry on a link error: Webshare's "File temporarily unavailable" does
         # not recover in practice. Failing right away frees the slot and lets *arr
         # blocklist the release (see torznab._pub_date) and grab another one.
@@ -389,3 +449,109 @@ class DownloadManager:
                     job.speed = (job.downloaded - last_bytes) / (now - last_t)
                     last_t = now
                     last_bytes = job.downloaded
+
+    # -- pyLoad backend ----------------------------------------------------
+
+    @staticmethod
+    def _pyload_name(job: Job) -> str:
+        return f"websharr-{job.nzo_id}"
+
+    def _pyload_folder(self, job: Job) -> Path:
+        return self._pyload_dir / self._pyload_name(job)
+
+    async def _download_pyload(self, job: Job) -> None:
+        # Any unexpected error (e.g. a malformed pyLoad response) fails the job
+        # with a readable reason; no job may stay "downloading" forever.
+        try:
+            if self._pyload is None:
+                raise PyloadError("pyLoad backend is not configured")
+            if job.pyload_pid:
+                try:
+                    await self._pyload_wait(job, reattached=True)
+                except _StaleAttach:
+                    logger.info("pyLoad package %d of %s is gone or failed; starting over",
+                                job.pyload_pid, job.nzo_id)
+                    await self._pyload_cleanup(job)
+                    job.pyload_pid = 0
+            if not job.pyload_pid:
+                url = await self._client.file_link(job.ident)
+                job.pyload_pid = await self._pyload.add_package(self._pyload_name(job), url)
+                self._save_state()
+                logger.info("Handed %s to pyLoad as package %d", job.nzo_id, job.pyload_pid)
+                await self._pyload_wait(job, reattached=False)
+            await self._pyload_finish(job)
+        except (PyloadError, WebshareError, OSError):
+            raise
+        except Exception as exc:
+            raise PyloadError(f"unexpected pyLoad response: {type(exc).__name__}: {exc}") from exc
+
+    async def _pyload_wait(self, job: Job, reattached: bool) -> None:
+        """Poll the package until all its files are finished."""
+        pid = job.pyload_pid
+        first = True
+        last_done = -1
+        last_change = time.monotonic()
+        while True:
+            try:
+                files = await self._pyload.package_files(pid)
+            except PyloadPackageGone:
+                if first and reattached:
+                    raise _StaleAttach from None
+                raise PyloadError(f"package removed in pyLoad (id {pid})") from None
+            failed = [f for f in files if f.status in FAILED_STATES]
+            if failed:
+                if first and reattached:
+                    raise _StaleAttach
+                f = failed[0]
+                reason = ": ".join(dict.fromkeys(m for m in (f.statusmsg, f.error) if m))
+                raise PyloadError(f"pyLoad download failed: {reason or 'unknown error'}")
+            first = False
+            if files and all(f.status == FINISHED for f in files):
+                job.speed = 0.0
+                return
+            done, speed = await self._pyload.progress(pid)
+            size = sum(f.size for f in files)
+            if size:
+                job.size = size
+            job.downloaded = done
+            job.speed = speed
+            now = time.monotonic()
+            if done != last_done:
+                last_done = done
+                last_change = now
+            elif now - last_change >= self._stall_seconds:
+                raise PyloadError(f"pyLoad download stalled: no progress for {_fmt_duration(self._stall_seconds)}")
+            await asyncio.sleep(PYLOAD_POLL_SECONDS)
+
+    async def _pyload_finish(self, job: Job) -> None:
+        """Move the finished file into the complete dir and drop the package.
+        pyLoad leaves .chunk* files next to the result; the largest other file
+        is the download."""
+        folder = self._pyload_folder(job)
+        files = [p for p in folder.iterdir()
+                 if p.is_file() and not p.suffix.startswith(".chunk")] if folder.is_dir() else []
+        if not files:
+            raise PyloadError(f"pyLoad finished but left no finished file in {folder}")
+        source = max(files, key=lambda p: p.stat().st_size)
+        final_dir = self._complete_dir / job.category / job.job_name
+        final_dir.mkdir(parents=True, exist_ok=True)
+        size = source.stat().st_size
+        shutil.move(str(source), final_dir / job.name)
+        await self._pyload_cleanup(job)
+        job.pyload_pid = 0
+        job.storage = str(final_dir)
+        job.size = job.downloaded = max(job.size, size)
+
+    async def _pyload_cleanup(self, job: Job) -> None:
+        """Remove this job's package and folder. pyLoad keeps the folder and
+        partial files after delete_packages, so Websharr removes it itself."""
+        if job.pyload_pid and self._pyload is not None:
+            try:
+                await self._pyload.delete_package(job.pyload_pid)
+            except PyloadError as exc:
+                logger.debug("pyLoad package %d not deleted: %s", job.pyload_pid, exc)
+        shutil.rmtree(self._pyload_folder(job), ignore_errors=True)
+
+
+def _fmt_duration(seconds: float) -> str:
+    return f"{seconds / 3600:g} h" if seconds >= 3600 else f"{seconds:g} s"
