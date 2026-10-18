@@ -18,7 +18,7 @@ import app.main as app_main
 from app.config import config
 from app.downloads import DownloadManager, Job
 from app.main import app
-from app.pyload import FINISHED, PyloadError, PyloadFile, PyloadPackageGone
+from app.pyload import FINISHED, PyloadError, PyloadFile, PyloadPackageGone, PyloadUnreachable
 
 from .conftest import FakeWebshareClient, wait_for
 from .test_downloads import _serve
@@ -50,6 +50,8 @@ class FakePyload:
         self.gone_pids: set[int] = set()
         self.closed = False
         self.delete_delay = 0.0
+        self.transient_polls = 0  # this many polls fail as "pyLoad unreachable"
+        self.no_row = False  # progress() finds no status_downloads row
 
     async def add_package(self, name: str, link: str) -> int:
         if self.add_error:
@@ -62,6 +64,9 @@ class FakePyload:
 
     async def package_files(self, pid: int) -> list[PyloadFile]:
         self.polled.append(pid)
+        if self.transient_polls:
+            self.transient_polls -= 1
+            raise PyloadUnreachable("pyLoad unreachable: ConnectError")
         if self.poll_error:
             raise self.poll_error
         if pid in self.gone_pids or pid not in self.packages:
@@ -76,7 +81,9 @@ class FakePyload:
         return [PyloadFile(fid=1, name="Movie.mkv", size=self.size, status=status,
                            statusmsg=self.statusmsg, error=self.error)]
 
-    async def progress(self, pid: int) -> tuple[int, float]:
+    async def progress(self, pid: int) -> tuple[int, float] | None:
+        if self.no_row:
+            return None
         return self.done, self.speed
 
     async def delete_package(self, pid: int) -> None:
@@ -189,13 +196,38 @@ def test_pyload_failed_status_fails_job(env):
     assert "failed" in job.error and "Link expired" in job.error
 
 
-def test_pyload_unreachable_fails_job(env):
+def test_pyload_unreachable_fails_job(env, monkeypatch):
     loop, fake, make, _ = env
-    fake.poll_error = PyloadError("pyLoad unreachable")
+    monkeypatch.setattr(downloads_module, "PYLOAD_ERROR_GRACE_SECONDS", 0.05)
+    fake.poll_error = PyloadUnreachable("pyLoad unreachable: ConnectError")
     manager = make()
     job = _add(loop, manager)
     assert wait_for(lambda: job.status == "failed")
     assert "pyLoad unreachable" in job.error
+    assert job.pyload_pid == 7  # pyLoad was unreachable: keep the package for a retry
+    assert fake.deleted == []
+
+
+def test_short_pyload_outage_does_not_fail_job(env, monkeypatch):
+    loop, fake, make, _ = env
+    monkeypatch.setattr(downloads_module, "PYLOAD_ERROR_GRACE_SECONDS", 5.0)
+    fake.transient_polls = 5
+    fake.script = [DOWNLOADING, FINISHED]
+    manager = make()
+    job = _add(loop, manager)
+    assert wait_for(lambda: job.status in ("completed", "failed"))
+    assert job.status == "completed", job.error
+    assert fake.transient_polls == 0
+
+
+def test_rejected_api_key_fails_immediately(env, monkeypatch):
+    loop, fake, make, _ = env
+    monkeypatch.setattr(downloads_module, "PYLOAD_ERROR_GRACE_SECONDS", 300.0)
+    fake.poll_error = PyloadError("pyLoad rejected the API key")
+    manager = make()
+    job = _add(loop, manager)
+    assert wait_for(lambda: job.status == "failed", timeout=1.0)
+    assert "rejected the API key" in job.error
 
 
 def test_pyload_rejects_api_key_on_add_fails_job(env):
@@ -308,14 +340,73 @@ def test_no_finished_file_fails_job(env):
 
 
 def test_stall_fails_job(env):
-    loop, fake, make, _ = env
+    loop, fake, make, tmp = env
     manager = make(stall_seconds=0.05)
     job = _add(loop, manager)
+    assert wait_for(lambda: job.pyload_pid == 7)
+    folder = tmp / "pyload" / f"websharr-{job.nzo_id}"
+    folder.mkdir(parents=True)
     assert wait_for(lambda: job.status == "failed")
     assert "stalled" in job.error
+    # A stall cleans up so a retry starts with a new package.
+    assert fake.deleted == [7] and 7 not in fake.packages
+    assert not folder.exists()
+    assert job.pyload_pid == 0
+    fake.script = [FINISHED]
+    assert loop.call(manager.retry, job.nzo_id) is job
+    assert wait_for(lambda: job.status == "completed"), job.error
+    assert [name for name, _ in fake.added] == [f"websharr-{job.nzo_id}"] * 2
 
 
-def test_delete_queued_pyload_job_removes_package_and_folder(env):
+def test_hide_from_sab_of_failed_pyload_job_removes_package_and_folder(env):
+    loop, fake, make, tmp = env
+    nzo_id = _write_state(tmp, status="failed")
+    fake.packages[7] = f"websharr-{nzo_id}"
+    folder = tmp / "pyload" / f"websharr-{nzo_id}"
+    folder.mkdir(parents=True)
+    (folder / "Movie.mkv.chunk0").write_bytes(b"partial")
+    manager = make()
+    loop.call(manager.load_state)
+    assert loop.call(manager.hide_from_sab, nzo_id) is True
+    assert wait_for(lambda: fake.deleted == [7] and not folder.exists())
+    assert manager.get(nzo_id).sab_hidden
+
+
+def test_hide_from_sab_of_failed_direct_job_leaves_pyload_alone(env):
+    loop, fake, make, tmp = env
+    nzo_id = _write_state(tmp, status="failed", backend="direct", pyload_pid=0)
+    manager = make()
+    loop.call(manager.load_state)
+    assert loop.call(manager.hide_from_sab, nzo_id) is True
+    time.sleep(0.1)
+    assert fake.deleted == []
+
+
+def test_pyload_client_removed_mid_job_fails_readably(env):
+    loop, fake, make, tmp = env
+    manager = make()
+    job = _add(loop, manager)
+    assert wait_for(lambda: job.pyload_pid == 7)
+    loop.call(manager.set_pyload, None, tmp / "pyload", 3600)
+    assert wait_for(lambda: job.status == "failed")
+    assert job.error == "pyLoad backend is not configured"
+
+
+def test_missing_progress_row_keeps_downloaded(env):
+    loop, fake, make, _ = env
+    fake.done, fake.speed = 500, 100.0
+    manager = make()
+    job = _add(loop, manager)
+    assert wait_for(lambda: job.downloaded == 500)
+    fake.no_row = True
+    polls = len(fake.polled)
+    assert wait_for(lambda: len(fake.polled) >= polls + 3)
+    assert job.downloaded == 500
+    assert job.speed == 0.0
+    assert job.status == "downloading"
+
+
+def test_delete_downloading_pyload_job_removes_package_and_folder(env):
     loop, fake, make, tmp = env
     manager = make()
     job = _add(loop, manager)
@@ -441,6 +532,11 @@ def test_webshare_network_error_reported_as_is(env):
 
 
 # -- app wiring (main.py lifespan) -------------------------------------------
+
+def test_httpx_request_logs_are_quiet(client):
+    assert logging.getLogger("httpx").level == logging.WARNING
+    assert logging.getLogger("httpcore").level == logging.WARNING
+
 
 @pytest.fixture
 def app_env(tmp_path, monkeypatch):
