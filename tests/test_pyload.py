@@ -78,7 +78,7 @@ def test_progress_uses_percent_and_speed():
     def empty(request):
         return httpx.Response(200, json=[])
 
-    assert run(make(empty).progress(5)) == (0, 0.0)
+    assert run(make(empty).progress(5)) is None  # no row for the package
 
 
 @pytest.mark.parametrize("code", [401, 403])
@@ -112,3 +112,31 @@ def test_delete_package_body():
     run(make(handler).delete_package(5))
     assert seen == {"path": "/api/delete_packages", "method": "POST",
                     "body": {"package_ids": [5]}}
+
+
+def test_connect_error_and_5xx_are_transient():
+    from app.pyload import PyloadUnreachable
+
+    def down(request):
+        raise httpx.ConnectError("boom", request=request)
+
+    with pytest.raises(PyloadUnreachable):
+        run(make(down).progress(5))
+
+    def busy(request):
+        return httpx.Response(503)
+
+    with pytest.raises(PyloadUnreachable, match="HTTP 503"):
+        run(make(busy).progress(5))
+
+
+def test_401_and_4xx_are_not_transient():
+    from app.pyload import PyloadUnreachable
+
+    for code in (401, 404):
+        def handler(request, code=code):
+            return httpx.Response(code)
+
+        with pytest.raises(PyloadError) as exc:
+            run(make(handler).add_package("n", "l"))
+        assert not isinstance(exc.value, PyloadUnreachable)

@@ -32,6 +32,9 @@ logging.basicConfig(
     level=config.log_level,
     format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
 )
+# httpx logs every request at INFO; pyLoad polls would flood the Log tab.
+for _name in ("httpx", "httpcore"):
+    logging.getLogger(_name).setLevel(logging.WARNING)
 logger = logging.getLogger("websharr")
 
 

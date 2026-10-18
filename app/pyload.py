@@ -24,6 +24,10 @@ class PyloadPackageGone(PyloadError):
     """The package no longer exists in pyLoad."""
 
 
+class PyloadUnreachable(PyloadError):
+    """A transient failure: connection error or HTTP 5xx. Worth retrying."""
+
+
 @dataclass
 class PyloadFile:
     fid: int
@@ -48,13 +52,15 @@ class PyloadClient:
         try:
             resp = await self._client.request(method, path, **kwargs)
         except httpx.HTTPError as e:
-            raise PyloadError(f"pyLoad unreachable: {type(e).__name__}") from None
+            raise PyloadUnreachable(f"pyLoad unreachable: {type(e).__name__}") from None
         if resp.status_code in (401, 403):
             raise PyloadError("pyLoad rejected the API key")
         return resp
 
     @staticmethod
     def _check(resp: httpx.Response) -> None:
+        if resp.status_code >= 500:
+            raise PyloadUnreachable(f"pyLoad returned HTTP {resp.status_code}")
         if resp.status_code >= 400:
             raise PyloadError(f"pyLoad returned HTTP {resp.status_code}")
 
@@ -83,15 +89,16 @@ class PyloadClient:
             for f in resp.json().get("links", [])
         ]
 
-    async def progress(self, pid: int) -> tuple[int, float]:
+    async def progress(self, pid: int) -> tuple[int, float] | None:
+        """Bytes done and speed of the package's active downloads; None when
+        pyLoad lists no active download for it (queued, waiting, finishing)."""
         resp = await self._request("GET", "/api/status_downloads")
         self._check(resp)
-        done = 0
-        speed = 0.0
-        for row in resp.json() or []:
-            if row.get("package_id") == pid:
-                done += int((row.get("size") or 0) * (row.get("percent") or 0) / 100)
-                speed += float(row.get("speed") or 0)
+        rows = [row for row in resp.json() or [] if row.get("package_id") == pid]
+        if not rows:
+            return None
+        done = sum(int((row.get("size") or 0) * (row.get("percent") or 0) / 100) for row in rows)
+        speed = sum(float(row.get("speed") or 0) for row in rows)
         return done, speed
 
     async def delete_package(self, pid: int) -> None:

@@ -21,7 +21,8 @@ from pathlib import Path
 import httpx
 
 from .nzb import sanitize_filename
-from .pyload import FAILED_STATES, FINISHED, PyloadClient, PyloadError, PyloadPackageGone
+from .pyload import (FAILED_STATES, FINISHED, PyloadClient, PyloadError, PyloadPackageGone,
+                     PyloadUnreachable)
 from .settings import BACKENDS
 from .webshare import WebshareClient, WebshareError
 
@@ -30,6 +31,9 @@ logger = logging.getLogger("websharr.downloads")
 CHUNK_SIZE = 1024 * 1024
 HISTORY_CAP = 500  # keep this many completed/failed records in the UI history
 PYLOAD_POLL_SECONDS = 5.0  # seconds between pyLoad status polls
+# How long polls may keep failing with a transient error (pyLoad restarting,
+# HTTP 5xx) before the job fails.
+PYLOAD_ERROR_GRACE_SECONDS = 300.0
 
 
 class _StaleAttach(Exception):
@@ -276,6 +280,8 @@ class DownloadManager:
         if job is None:
             return False
         job.sab_hidden = True
+        if job.backend == "pyload" and job.status == "failed":
+            self._spawn_pyload_cleanup(job)  # *arr gave up on it
         if del_files and job.storage:
             shutil.rmtree(job.storage, ignore_errors=True)
         self._save_state()
@@ -310,9 +316,7 @@ class DownloadManager:
             task.cancel()
         self._cleanup_incomplete(job)
         if job.backend == "pyload":
-            cleanup = asyncio.create_task(self._pyload_cleanup(job))
-            self._cleanups.add(cleanup)
-            cleanup.add_done_callback(self._cleanups.discard)
+            self._spawn_pyload_cleanup(job)
         if del_files and job.storage:
             shutil.rmtree(job.storage, ignore_errors=True)
         self._save_state()
@@ -452,6 +456,17 @@ class DownloadManager:
 
     # -- pyLoad backend ----------------------------------------------------
 
+    def _spawn_pyload_cleanup(self, job: Job) -> None:
+        cleanup = asyncio.create_task(self._pyload_cleanup(job))
+        self._cleanups.add(cleanup)
+        cleanup.add_done_callback(self._cleanups.discard)
+
+    def _require_pyload(self) -> PyloadClient:
+        # Looked up on every call: the settings UI may swap or remove the client.
+        if self._pyload is None:
+            raise PyloadError("pyLoad backend is not configured")
+        return self._pyload
+
     @staticmethod
     def _pyload_name(job: Job) -> str:
         return f"websharr-{job.nzo_id}"
@@ -463,8 +478,7 @@ class DownloadManager:
         # Any unexpected error (e.g. a malformed pyLoad response) fails the job
         # with a readable reason; no job may stay "downloading" forever.
         try:
-            if self._pyload is None:
-                raise PyloadError("pyLoad backend is not configured")
+            self._require_pyload()
             if job.pyload_pid:
                 try:
                     await self._pyload_wait(job, reattached=True)
@@ -475,7 +489,7 @@ class DownloadManager:
                     job.pyload_pid = 0
             if not job.pyload_pid:
                 url = await self._client.file_link(job.ident)
-                job.pyload_pid = await self._pyload.add_package(self._pyload_name(job), url)
+                job.pyload_pid = await self._require_pyload().add_package(self._pyload_name(job), url)
                 self._save_state()
                 logger.info("Handed %s to pyLoad as package %d", job.nzo_id, job.pyload_pid)
                 await self._pyload_wait(job, reattached=False)
@@ -491,14 +505,29 @@ class DownloadManager:
         first = True
         last_done = -1
         last_change = time.monotonic()
+        error_since = None  # start of the current run of transient errors
         while True:
             try:
-                files = await self._pyload.package_files(pid)
+                files = await self._require_pyload().package_files(pid)
+                failed = [f for f in files if f.status in FAILED_STATES]
+                finished = bool(files) and all(f.status == FINISHED for f in files)
+                progress = None
+                if not failed and not finished:
+                    progress = await self._require_pyload().progress(pid)
             except PyloadPackageGone:
                 if first and reattached:
                     raise _StaleAttach from None
                 raise PyloadError(f"package removed in pyLoad (id {pid})") from None
-            failed = [f for f in files if f.status in FAILED_STATES]
+            except PyloadUnreachable as exc:
+                now = time.monotonic()
+                if error_since is None:
+                    error_since = now
+                    logger.warning("pyLoad poll for %s failed, retrying: %s", job.nzo_id, exc)
+                if now - error_since >= PYLOAD_ERROR_GRACE_SECONDS:
+                    raise
+                await asyncio.sleep(PYLOAD_POLL_SECONDS)
+                continue
+            error_since = None
             if failed:
                 if first and reattached:
                     raise _StaleAttach
@@ -506,20 +535,24 @@ class DownloadManager:
                 reason = ": ".join(dict.fromkeys(m for m in (f.statusmsg, f.error) if m))
                 raise PyloadError(f"pyLoad download failed: {reason or 'unknown error'}")
             first = False
-            if files and all(f.status == FINISHED for f in files):
+            if finished:
                 job.speed = 0.0
                 return
-            done, speed = await self._pyload.progress(pid)
             size = sum(f.size for f in files)
             if size:
                 job.size = size
-            job.downloaded = done
-            job.speed = speed
+            if progress is None:
+                job.speed = 0.0  # no active download row: keep the last byte count
+            else:
+                job.downloaded, job.speed = progress
             now = time.monotonic()
-            if done != last_done:
-                last_done = done
+            if job.downloaded != last_done:
+                last_done = job.downloaded
                 last_change = now
             elif now - last_change >= self._stall_seconds:
+                # Clean up so a retry starts with a new package.
+                await self._pyload_cleanup(job)
+                job.pyload_pid = 0
                 raise PyloadError(f"pyLoad download stalled: no progress for {_fmt_duration(self._stall_seconds)}")
             await asyncio.sleep(PYLOAD_POLL_SECONDS)
 
