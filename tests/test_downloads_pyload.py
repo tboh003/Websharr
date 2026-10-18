@@ -3,8 +3,12 @@
 import asyncio
 import json
 import logging
+import shutil
 import threading
+import time
 from pathlib import Path
+
+import httpx
 
 import pytest
 from fastapi.testclient import TestClient
@@ -45,6 +49,7 @@ class FakePyload:
         self.add_error: BaseException | None = None
         self.gone_pids: set[int] = set()
         self.closed = False
+        self.delete_delay = 0.0
 
     async def add_package(self, name: str, link: str) -> int:
         if self.add_error:
@@ -76,6 +81,8 @@ class FakePyload:
 
     async def delete_package(self, pid: int) -> None:
         self.deleted.append(pid)
+        if self.delete_delay:
+            await asyncio.sleep(self.delete_delay)
         if pid not in self.packages:
             raise PyloadError("pyLoad returned HTTP 500")
         del self.packages[pid]
@@ -380,6 +387,57 @@ def test_direct_backend_unchanged(env):
         assert fake.added == [] and fake.polled == []
     finally:
         httpd.shutdown()
+
+
+def test_finish_moves_file_off_the_event_loop(env, monkeypatch):
+    loop, fake, make, tmp = env
+    fake.script = [FINISHED]
+    real_move = shutil.move
+    threads = []
+
+    def slow_move(src, dst):
+        threads.append(threading.current_thread())
+        time.sleep(0.3)  # a cross-volume copy
+        return real_move(src, dst)
+
+    monkeypatch.setattr(downloads_module.shutil, "move", slow_move)
+    manager = make()
+    job = _add(loop, manager)
+    assert wait_for(lambda: threads)
+    started = time.monotonic()
+    loop.call(lambda: None)  # the loop still answers during the move
+    assert time.monotonic() - started < 0.2
+    assert wait_for(lambda: job.status in ("completed", "failed"))
+    assert job.status == "completed", job.error
+    assert threads[0] is not loop.thread
+
+
+def test_delete_with_files_during_finish_cleanup_removes_moved_file(env):
+    loop, fake, make, tmp = env
+    fake.script = [FINISHED]
+    fake.delete_delay = 0.5
+    manager = make()
+    job = _add(loop, manager)
+    assert wait_for(lambda: fake.deleted)  # file moved, package cleanup waiting
+    final_dir = tmp / "complete" / "movies" / job.job_name
+    assert (final_dir / job.name).exists()
+    assert job.storage == str(final_dir)
+    assert loop.call(manager.delete, job.nzo_id, del_files=True) is True
+    assert wait_for(lambda: not final_dir.exists())
+
+
+def test_webshare_network_error_reported_as_is(env):
+    loop, fake, make, _ = env
+    manager = make()
+
+    async def boom(ident):
+        raise httpx.ConnectTimeout("timed out")
+
+    manager._client.file_link = boom
+    job = _add(loop, manager)
+    assert wait_for(lambda: job.status == "failed")
+    assert job.error == "timed out"
+    assert fake.added == []
 
 
 # -- app wiring (main.py lifespan) -------------------------------------------
