@@ -879,7 +879,7 @@
           <input id="set-pyload-key" type="password" autocomplete="off"
             placeholder="•••••••• (leave empty to keep current)"></label>
         <label>Stall timeout (hours)
-          <input id="set-pyload-stall" type="number" min="1" step="1" value="6"></label>
+          <input id="set-pyload-stall" type="number" min="1" step="1" value="24"></label>
         <div class="srow">
           <div class="spacer"></div>
           <button class="primary" id="set-backend-save">Save backend</button>
@@ -1180,7 +1180,7 @@ const App = {
       $("set-pyload-key").value = "";
       $("set-pyload-key").placeholder = s.pyload_api_key_set
         ? "•••••••• (set — leave empty to keep)" : "pyLoad API key";
-      $("set-pyload-stall").value = s.pyload_stall_hours || 6;
+      $("set-pyload-stall").value = s.pyload_stall_hours || 24;
       this.renderAliases(s.aliases || []);
     } catch (e) { /* offline banner already covers this */ }
   },
@@ -1801,7 +1801,7 @@ $("set-backend-save").onclick = async () => {
   const body = {
     download_backend: $("set-backend").value,
     pyload_url: $("set-pyload-url").value.trim(),
-    pyload_stall_hours: parseInt($("set-pyload-stall").value, 10) || 6,
+    pyload_stall_hours: parseInt($("set-pyload-stall").value, 10) || 24,
   };
   const key = $("set-pyload-key").value.trim();
   if (key) body.pyload_api_key = key;   // empty keeps the saved key
