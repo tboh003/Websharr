@@ -11,7 +11,7 @@ permissions:
   packages: write
 
 env:
-  IMAGE: ghcr.io/janprochy/websharr
+  IMAGE: ghcr.io/tboh003/websharr
 
 jobs:
   build:

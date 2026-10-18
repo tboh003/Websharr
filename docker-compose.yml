@@ -1,6 +1,6 @@
 services:
     websharr:
-        image: ghcr.io/janprochy/websharr:latest
+        image: ghcr.io/tboh003/websharr:latest
         # Uncomment to build from source instead of pulling the published image:
         # build: .
         container_name: websharr
@@ -19,6 +19,10 @@ services:
             TMDB_TOKEN: ${TMDB_TOKEN:-}
             NOTIFY_URLS: ${NOTIFY_URLS:-}
             MAX_CONCURRENT_DOWNLOADS: "2"
+            # Optional: hand downloads to a pyLoad instance (see README, "pyLoad backend").
+            DOWNLOAD_BACKEND: ${DOWNLOAD_BACKEND:-direct}
+            PYLOAD_URL: ${PYLOAD_URL:-}
+            PYLOAD_API_KEY: ${PYLOAD_API_KEY:-}
         volumes:
             # Must be the SAME host path that Sonarr/Radarr see as their download dir,
             # otherwise use Remote Path Mappings in *arr.
