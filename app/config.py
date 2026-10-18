@@ -26,6 +26,12 @@ class Config:
         self.settings_file = Path(os.environ.get("SETTINGS_FILE", "/config/settings.json"))
         self.max_concurrent = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", "2"))
         self.search_limit = int(os.environ.get("SEARCH_LIMIT", "60"))
+        # Download backend: "direct" (built-in downloader) or "pyload" (hand off to pyLoad).
+        self.download_backend = os.environ.get("DOWNLOAD_BACKEND", "direct")
+        self.pyload_url = os.environ.get("PYLOAD_URL", "")
+        self.pyload_api_key = os.environ.get("PYLOAD_API_KEY", "")
+        self.pyload_download_dir = Path(os.environ.get("PYLOAD_DOWNLOAD_DIR", "/downloads"))
+        self.pyload_stall_hours = int(os.environ.get("PYLOAD_STALL_HOURS", "24"))
         self.log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
 
 

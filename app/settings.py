@@ -21,6 +21,7 @@ PBKDF2_ITERATIONS = 200_000
 SESSION_TTL = 14 * 86400  # seconds
 DEFAULT_THEME = "websharr-blue"
 THEMES = frozenset({DEFAULT_THEME, "osaka-jade", "space-grey"})
+BACKENDS = frozenset({"direct", "pyload"})
 
 
 def hash_password(password: str) -> str:
@@ -66,6 +67,12 @@ class Settings:
         self.notify_urls: list[str] = list(config.notify_urls)
         self.notify_vip_days: int = config.notify_vip_days
         self.theme: str = DEFAULT_THEME
+        # Download backend and pyLoad connection; env vars are the initial
+        # defaults, saved UI values override them. The download dir is env-only.
+        self.download_backend: str = config.download_backend if config.download_backend in BACKENDS else "direct"
+        self.pyload_url: str = config.pyload_url
+        self.pyload_api_key: str = config.pyload_api_key
+        self.pyload_stall_hours: int = config.pyload_stall_hours
 
     @property
     def configured(self) -> bool:
@@ -105,6 +112,16 @@ class Settings:
             self.notify_vip_days = config.notify_vip_days
         theme = data.get("theme", DEFAULT_THEME)
         self.theme = theme if theme in THEMES else DEFAULT_THEME
+        backend = data.get("download_backend") or config.download_backend
+        self.download_backend = backend if backend in BACKENDS else "direct"
+        pyload = data.get("pyload")
+        pyload = pyload if isinstance(pyload, dict) else {}
+        self.pyload_url = pyload.get("url") or config.pyload_url
+        self.pyload_api_key = pyload.get("api_key") or config.pyload_api_key
+        try:
+            self.pyload_stall_hours = max(1, int(pyload.get("stall_hours") or config.pyload_stall_hours))
+        except (TypeError, ValueError):
+            self.pyload_stall_hours = config.pyload_stall_hours
 
     def save(self) -> None:
         path = config.settings_file
@@ -124,6 +141,12 @@ class Settings:
             "notify_urls": self.notify_urls,
             "notify_vip_days": self.notify_vip_days,
             "theme": self.theme,
+            "download_backend": self.download_backend,
+            "pyload": {
+                "url": self.pyload_url,
+                "api_key": self.pyload_api_key,
+                "stall_hours": self.pyload_stall_hours,
+            },
         }
         path.write_text(json.dumps(data, indent=2), encoding="utf-8")
         path.chmod(0o600)
@@ -147,6 +170,10 @@ class Settings:
             config.webshare_username = self.webshare_username
             config.webshare_password = self.webshare_password
             config.webshare_password_digest = self.webshare_password_digest
+        config.download_backend = self.download_backend
+        config.pyload_url = self.pyload_url
+        config.pyload_api_key = self.pyload_api_key
+        config.pyload_stall_hours = self.pyload_stall_hours
 
     # -- session cookies ----------------------------------------------------
 
