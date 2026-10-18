@@ -267,8 +267,12 @@ async def ui_settings_post(request: Request):
         settings.max_concurrent = request.app.state.downloads.set_max_concurrent(n)
 
     pyload_changed = False
-    if any(k in body for k in ("download_backend", "pyload_url", "pyload_api_key",
-                               "pyload_stall_hours")):
+    pyload_fields = ("download_backend", "pyload_url", "pyload_api_key", "pyload_stall_hours")
+    old_pyload = (settings.pyload_url, settings.pyload_api_key)
+    if any(k in body for k in pyload_fields):
+        for name in ("pyload_url", "pyload_api_key"):
+            if name in body and not isinstance(body[name], str):
+                return JSONResponse({"error": f"{name} must be a string"}, status_code=400)
         backend = body.get("download_backend", settings.download_backend)
         if backend not in BACKENDS:
             return JSONResponse({"error": "Unknown download backend"}, status_code=400)
@@ -283,6 +287,10 @@ async def ui_settings_post(request: Request):
             return JSONResponse(
                 {"error": "pyLoad needs a URL and an API key"}, status_code=400)
         pyload_changed = True
+        # Only fields sent here are saved; the others keep following the env.
+        # An empty key means "keep the current one", so it does not count.
+        settings.pyload_ui_set.update(
+            k for k in pyload_fields if k in body and (k != "pyload_api_key" or body[k].strip()))
         settings.download_backend = backend
         settings.pyload_url = url
         settings.pyload_api_key = key
@@ -308,13 +316,17 @@ async def ui_settings_post(request: Request):
     if pyload_changed:
         manager: DownloadManager = request.app.state.downloads
         old = getattr(request.app.state, "pyload", None)
-        new = (PyloadClient(config.pyload_url, config.pyload_api_key)
-               if config.pyload_url and config.pyload_api_key else None)
-        manager.set_pyload(new, config.pyload_download_dir,
-                           max(1, settings.pyload_stall_hours) * 3600.0)
-        request.app.state.pyload = new
-        if old is not None:
-            await old.close()
+        stall_seconds = max(1, settings.pyload_stall_hours) * 3600.0
+        if (settings.pyload_url, settings.pyload_api_key) == old_pyload:
+            # Same connection: keep the client, only the stall timeout may differ.
+            manager.set_pyload(old, config.pyload_download_dir, stall_seconds)
+        else:
+            new = (PyloadClient(config.pyload_url, config.pyload_api_key)
+                   if config.pyload_url and config.pyload_api_key else None)
+            manager.set_pyload(new, config.pyload_download_dir, stall_seconds)
+            request.app.state.pyload = new
+            if old is not None:
+                await old.close()
         manager.set_backend(settings.download_backend)
     return {"ok": True, "api_key": config.api_key}
 

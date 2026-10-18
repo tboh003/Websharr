@@ -22,6 +22,8 @@ SESSION_TTL = 14 * 86400  # seconds
 DEFAULT_THEME = "websharr-blue"
 THEMES = frozenset({DEFAULT_THEME, "osaka-jade", "space-grey"})
 BACKENDS = frozenset({"direct", "pyload"})
+# pyLoad settings field -> key under "pyload" in settings.json.
+_PYLOAD_KEYS = {"pyload_url": "url", "pyload_api_key": "api_key", "pyload_stall_hours": "stall_hours"}
 
 
 def hash_password(password: str) -> str:
@@ -69,6 +71,9 @@ class Settings:
         self.theme: str = DEFAULT_THEME
         # Download backend and pyLoad connection; env vars are the initial
         # defaults, saved UI values override them. The download dir is env-only.
+        # Only fields set in the UI are saved (pyload_ui_set), so an unset field
+        # keeps following the env, e.g. a PYLOAD_API_KEY rotated in Vault.
+        self.pyload_ui_set: set[str] = set()
         self.download_backend: str = config.download_backend if config.download_backend in BACKENDS else "direct"
         self.pyload_url: str = config.pyload_url
         self.pyload_api_key: str = config.pyload_api_key
@@ -116,6 +121,11 @@ class Settings:
         self.download_backend = backend if backend in BACKENDS else "direct"
         pyload = data.get("pyload")
         pyload = pyload if isinstance(pyload, dict) else {}
+        # A key present in the file was set in the UI (older files wrote all keys:
+        # treating those as UI-set keeps their previous behavior).
+        self.pyload_ui_set = {name for name, key in _PYLOAD_KEYS.items() if key in pyload}
+        if "download_backend" in data:
+            self.pyload_ui_set.add("download_backend")
         self.pyload_url = pyload.get("url") or config.pyload_url
         self.pyload_api_key = pyload.get("api_key") or config.pyload_api_key
         try:
@@ -141,13 +151,13 @@ class Settings:
             "notify_urls": self.notify_urls,
             "notify_vip_days": self.notify_vip_days,
             "theme": self.theme,
-            "download_backend": self.download_backend,
-            "pyload": {
-                "url": self.pyload_url,
-                "api_key": self.pyload_api_key,
-                "stall_hours": self.pyload_stall_hours,
-            },
         }
+        if "download_backend" in self.pyload_ui_set:
+            data["download_backend"] = self.download_backend
+        pyload = {key: getattr(self, name) for name, key in _PYLOAD_KEYS.items()
+                  if name in self.pyload_ui_set}
+        if pyload:
+            data["pyload"] = pyload
         path.write_text(json.dumps(data, indent=2), encoding="utf-8")
         path.chmod(0o600)
 
